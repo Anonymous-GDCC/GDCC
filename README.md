@@ -36,7 +36,7 @@ Clone this repo and create the GDCC environment with conda. We test the code und
 
 We provide original L2I generation model and the model fine-tuned with GDCC for comparison. Download and put them into `./pretrained_diffusers/`.
 
-|        Dataset        |  L2I Model   | GDCC Fine-tune | Image Resolution | Grid Size |                           Download                           |
+|        Dataset        |  L2I Model   | GDCC Fine-tune | Image Resolution | Grid Size |                           Download                          |
 | :-------------------: |:------------:|:--------------:| :--------------: | :-------: | :----------------------------------------------------------: |
 |      COCO-Stuff       | GeoDiffusion |       ×        |     256x256      |  256x256  | [HF Hub](https://huggingface.co/KaiChen1998/geodiffusion-coco-stuff-256x256) |
 |      COCO-Stuff       | GeoDiffusion |       √        |     256x256      |  256x256  | [HF Hub](https://huggingface.co/AnonymousGDCC/GeoDiffusion_256x256_GDCC/tree/main) |
