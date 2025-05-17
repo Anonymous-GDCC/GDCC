@@ -15,11 +15,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+from torch.distributions import Categorical
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from datasets import load_dataset
 from diffusers import AutoencoderKL, DDPMScheduler, PNDMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
@@ -31,24 +31,19 @@ from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 from mmcv import Config
 from mmdet.datasets import build_dataset
 import utils.misc as misc
-from utils.det_utils import calculate_box_loss, Matcher
-from mmdet.apis import init_detector, inference_detector
+from utils.det_utils import calculate_box_loss
+from mmdet.apis import init_detector
 from utils.inference_with_probs import inference_detector_with_probs
-from utils.det_utils import visualize_predictions
-from torchvision.transforms.functional import normalize
-
+from utils.misc import sample_timesteps
 from utils.data.nuimage import NuImageDataset
 from utils.data.coco_stuff import COCOStuffDataset
-from utils.misc import sample_timesteps
-
 
 logger = get_logger(__name__)
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
 
-    # model pre-trained name (download from huggingface) or path (local) 
+    # model pre-trained name (download from huggingface) or path (local)
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -157,6 +152,12 @@ def parse_args():
         type=float,
         default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--learning_rate_det",
+        type=float,
+        default=1e-4,
+        help="Learning rate for detection model.",
     )
     parser.add_argument(
         "--lr_text_ratio",
@@ -273,7 +274,14 @@ def parse_args():
     parser.add_argument(
         "--reward_scale", type=float, default=0.1, help="Scale divided for reward loss value."
     )
-    parser.add_argument("--timestep_resample", default=3, type=int, help="Number of classes.")
+    parser.add_argument(
+        "--reward_scale_2", type=float, default=0.1, help="Scale divided for reward loss value."
+    )
+    parser.add_argument("--timestep_resample", default=6, type=int, help="Number of classes.")
+
+    # New arguments for alternating updates
+    parser.add_argument("--n_unet_steps", type=int, default=1000, help="Number of steps to train unet before switching.")
+    parser.add_argument("--n_det_steps", type=int, default=1000, help="Number of steps to train detect_model before switching.")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -281,7 +289,6 @@ def parse_args():
         args.local_rank = env_local_rank
 
     return args
-
 
 def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
     if token is None:
@@ -291,7 +298,6 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{username}/{model_id}"
     else:
         return f"{organization}/{model_id}"
-
 
 # Adapted from torch-ema https://github.com/fadel/pytorch_ema/blob/master/torch_ema/ema.py#L14
 class EMAModel:
@@ -380,7 +386,6 @@ class EMAModel:
 
         del self.collected_params
         gc.collect()
-
 
 def check_existence(text, candidates):
     for each in candidates:
@@ -490,9 +495,9 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
 
     # Load detectors
-    # detect_model = Darknet(args.detect_model_config)
-    # detect_model.load_weights(args.detect_model_path)
     detect_model = init_detector(args.detect_model_config, args.detect_model_path).to(accelerator.device)
+    # We do not set detect_model to eval or requires_grad_(False) here
+    # We will control it during training phases
 
     num_words = text_encoder.get_input_embeddings().num_embeddings
     # add location tokens
@@ -518,9 +523,7 @@ def main():
 
         assert len(tokenizer.get_vocab()) == text_encoder.get_input_embeddings().weight.size()[0]
 
-    # Freeze vae, text_encoder, detect_model
-    detect_model.requires_grad_(False)
-    detect_model.eval()
+    # Freeze vae
     vae.requires_grad_(False)
     if not args.train_text_encoder:
         text_encoder.requires_grad_(False)
@@ -547,6 +550,9 @@ def main():
     if args.scale_lr:
         args.learning_rate = (
                 args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        )
+        args.learning_rate_det = (
+                args.learning_rate_det * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
     # Initialize the optimizer
@@ -579,24 +585,24 @@ def main():
     if accelerator.is_local_main_process:
         print(optimizer)
 
+    # Optimizer for detection model
+    optimizer_det = torch.optim.AdamW(
+        detect_model.parameters(),
+        lr=args.learning_rate_det,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
     # MODIFY: to be consistent with the pre-trained model
     noise_scheduler = DDPMScheduler.from_config(args.pretrained_model_name_or_path, subfolder="scheduler")
-
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
     def tokenize_captions(examples, is_train=True):
         captions = []
         for example in examples:
-            caption = example[caption_column]
+            caption = example["text"]
             if isinstance(caption, str):
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
@@ -604,7 +610,7 @@ def main():
                 captions.append(random.choice(caption) if is_train else caption[0])
             else:
                 raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
+                    f"Caption column `text` should contain either strings or lists of strings."
                 )
         # pad in the collate_fn function
         inputs = tokenizer(captions, max_length=tokenizer.model_max_length, padding="do_not_pad", truncation=True)
@@ -645,7 +651,8 @@ def main():
             "attention_mask": padded_tokens.attention_mask,
             "bbox_mask": bbox_mask,
             "boxes": boxes,
-            "boxes_valid": boxes_valid
+            "boxes_valid": boxes_valid,
+            "text": [example["text"] for example in examples],  # include text for generating new captions
         }
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -661,20 +668,27 @@ def main():
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
-
         optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+    )
+
+    # Scheduler for detection model optimizer
+    lr_scheduler_det = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer_det,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
     # convert to the corresponding distributed version one by one for any kinds of objects
     if args.train_text_encoder:
-        unet, text_encoder, optimizer, train_dataloader = accelerator.prepare(
-            unet, text_encoder, optimizer, train_dataloader
+        unet, text_encoder, detect_model, optimizer, optimizer_det, train_dataloader = accelerator.prepare(
+            unet, text_encoder, detect_model, optimizer, optimizer_det, train_dataloader
         )
     else:
-        unet, optimizer, train_dataloader = accelerator.prepare(
-            unet, optimizer, train_dataloader
+        unet, detect_model, optimizer, optimizer_det, train_dataloader = accelerator.prepare(
+            unet, detect_model, optimizer, optimizer_det, train_dataloader
         )
 
     weight_dtype = torch.float32
@@ -714,6 +728,13 @@ def main():
         saved_args.train_text_encoder_params = ' '.join(saved_args.train_text_encoder_params)
         accelerator.init_trackers("text2image-fine-tune", config=vars(saved_args))
 
+    # Determine dataset type
+    dataset_type = 'nuimage' if 'nuimage' in args.dataset_config_name.lower() else 'coco' if 'coco' in args.dataset_config_name.lower() else None
+    if dataset_type is None:
+        raise ValueError("Unsupported dataset type. Please ensure dataset_config_name contains 'nuimage' or 'coco'.")
+
+    num_bucket_per_side = args.num_bucket_per_side
+
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -729,36 +750,45 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
     global_step = 0
-
     img_size_w = int(args.pretrained_model_name_or_path.split('-')[-1].split('x')[0])
     img_size_h = int(args.pretrained_model_name_or_path.split('-')[-1].split('x')[1])
 
     transform = transforms.ToTensor()
+
+    # Training Loop
     for epoch in range(args.num_train_epochs):
         unet.train()
+        detect_model.train()
         if args.train_text_encoder:
             text_encoder.train()
         train_loss, train_pretrain_loss, train_cycle_loss = 0., 0., 0.
+        train_det_loss, train_pred_loss, train_icycle_loss = 0., 0., 0.
+        
         for step, batch in enumerate(train_dataloader):
+            # Both unet and detect_model should be in training mode
+            unet.train()
+            unet.requires_grad_(True)
+            detect_model.train()
+            detect_model.requires_grad_(True)
+            if args.train_text_encoder:
+                text_encoder.train()
+                text_encoder.requires_grad_(True)
+            
             # for gradient accumulation
-            with accelerator.accumulate(unet):
-
+            with accelerator.accumulate([unet, detect_model]):
                 # Convert images to latent space
-
                 # images: [B, 3, 512, 512], latents: [B, 4, 64, 64]
                 latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-                # multiply with the scalr factor
+                # multiply with the scalar factor
                 latents = latents * 0.18215
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                # timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
-                # timesteps = timesteps.long()
-
+                
+                # Sample timesteps
                 timesteps = sample_timesteps(bsz, args.min_timestep_rewarding, args.max_timestep_rewarding,
-                                             noise_scheduler.num_train_timesteps, args.timestep_resample)
+                                            noise_scheduler.num_train_timesteps, args.timestep_resample)
                 timesteps = timesteps.long()
 
                 # Determine which samples in the current batch need to calculate reward loss
@@ -766,11 +796,9 @@ def main():
                                 (timesteps.reshape(-1, 1) <= args.max_timestep_rewarding)
 
                 # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                # Return last_hidden_state of the text: [B, L, D=768]
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
                 # Predict the noise residual and compute loss
@@ -785,6 +813,7 @@ def main():
                 reconstructed_images = vae.decode(sample_latents / 0.18215).sample
                 reconstructed_images = (reconstructed_images / 2 + 0.5).clamp(0, 1)
 
+                # Detect reconstructed images
                 boxes_pred = []
                 logits_pred = []
 
@@ -793,7 +822,6 @@ def main():
                         continue
 
                     boxes_pred_image = []
-                    scores_pred_image = []
 
                     image_tensor = reconstructed_images[i:i+1]
                     # Convert image tensor to float32 to match the detection model's weight type
@@ -804,7 +832,7 @@ def main():
                     gt_boxes = batch["boxes"][i]
 
                     for detection in boxes_score_pred_image:
-                        x1, y1, x2, y2 = detection
+                        x1, y1, x2, y2 = detection[:4]  # Safely unpack first 4 elements
                         boxes_pred_image.append(torch.stack([x1 / img_size_w, y1 / img_size_h, x2 / img_size_w, y2 / img_size_h]))
 
                     boxes_pred.append(torch.stack(boxes_pred_image) if boxes_pred_image else torch.zeros((0, 4), device=image_tensor.device))
@@ -812,46 +840,138 @@ def main():
 
                 filtered_gt_boxes = batch["boxes"][timestep_mask.view(-1)]
 
+                # Calculate layout translation loss
                 if len(filtered_gt_boxes) == 0:
-                    box_loss = torch.tensor(0.0, device=filtered_gt_boxes.device)
-                    cls_loss = torch.tensor(0.0, device=filtered_gt_boxes.device)
+                    box_loss = torch.tensor(0.0, device=latents.device)
+                    cls_loss = torch.tensor(0.0, device=latents.device)
                 else:
                     box_loss, cls_loss = calculate_box_loss(boxes_pred, logits_pred, filtered_gt_boxes)
 
-                cycle_loss = box_loss + cls_loss
-                cycle_loss = cycle_loss / (timestep_mask.sum() + 1e-10)
+                l_cycle_loss = box_loss + cls_loss
+                l_cycle_loss = l_cycle_loss / (timestep_mask.sum() + 1e-10)
 
-                pretrain_loss = (noise_pred.float() - noise.float()) ** 2 # [B, 4, H, W]
-                pretrain_loss = pretrain_loss * batch["bbox_mask"] if args.foreground_loss_mode else pretrain_loss
-                pretrain_loss = pretrain_loss.mean()
+                # Original Latent Diffusion Loss
+                ldm_loss = (noise_pred.float() - noise.float()) ** 2  # [B, 4, H, W]
+                ldm_loss = ldm_loss * batch["bbox_mask"] if args.foreground_loss_mode else ldm_loss
+                ldm_loss = ldm_loss.mean()
 
-                loss = pretrain_loss + cycle_loss * args.reward_scale
+                # Total training loss for generation model
+                gen_loss = ldm_loss + l_cycle_loss * args.reward_scale
 
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                avg_pretrain_loss = accelerator.gather(pretrain_loss.repeat(args.train_batch_size)).mean()
-                avg_cycle_loss = accelerator.gather(cycle_loss.repeat(args.train_batch_size)).mean()
+                # Compute image translation loss for detector
+                # Generate text representation from boxes
+                texts_from_boxes = []
+                for b_pred, logit_pred in zip(boxes_pred, logits_pred):
+                    # First get labels to generate text
+                    labels_pred = torch.argmax(logit_pred, dim=-1)
+                    text = generate_text_from_boxes(b_pred, labels_pred, args, dataset_type, num_bucket_per_side)
+                    texts_from_boxes.append(text)
 
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
-                train_pretrain_loss += avg_pretrain_loss.item() / args.gradient_accumulation_steps
-                train_cycle_loss += avg_cycle_loss.item() / args.gradient_accumulation_steps
+                # Tokenize the new captions
+                if texts_from_boxes:  # Only if we have any texts
+                    input_ids_2 = tokenizer(texts_from_boxes, max_length=tokenizer.model_max_length, 
+                                          padding="max_length", truncation=True, 
+                                          return_tensors="pt").input_ids.to(accelerator.device)
+                    
+                    # Get encoder_hidden_states_2
+                    encoder_hidden_states_2 = text_encoder(input_ids_2)[0]
 
-                # Back propagate
-                accelerator.backward(loss)
+                    # Compute noise_pred_2 using the new text prompts
+                    noise_pred_2 = unet(noisy_latents, timesteps, encoder_hidden_states_2).sample
+
+                    # Image translation loss
+                    i_cycle_loss = ((noise_pred.float() - noise_pred_2.float()) ** 2).mean()
+                    
+                    # RL training approach - use i_cycle_loss as reward signal
+                    reward = -i_cycle_loss.detach()  # Use negative i_cycle_loss as reward, detached from computation graph
+                    # Get hard labels from logits for log_prob calculation
+                    labels_for_rl = []
+                    for logit_pred in logits_pred:
+                        labels_for_rl.append(torch.argmax(logit_pred, dim=-1))
+                    log_prob = get_log_prob_of_labels(logits_pred, labels_for_rl)
+                    rl_loss = -log_prob * reward  # Policy gradient formula
+                else:
+                    i_cycle_loss = torch.tensor(0.0, device=latents.device)
+                    rl_loss = torch.tensor(0.0, device=latents.device)
+
+                # Compute prediction loss
+                original_images = batch["pixel_values"]  # Directly use tensor format [B, C, H, W]
+                
+                boxes_pred_original = []
+                logits_pred_original = []
+                
+                for i in range(original_images.shape[0]):
+                    image_tensor = original_images[i:i+1]
+                    # Convert image tensor to float32 to match the detection model's weight type
+                    image_tensor = image_tensor.to(dtype=torch.float32)
+
+                    boxes_score_pred_image, _, logits_pred_image = inference_detector_with_probs(detect_model, image_tensor)
+                    boxes_score_pred_image = boxes_score_pred_image[0]
+                    logits_pred_image = logits_pred_image[0]
+                    
+                    boxes_pred_image = []
+                    for detection in boxes_score_pred_image:
+                        x1, y1, x2, y2 = detection
+                        boxes_pred_image.append(torch.stack([x1 / img_size_w, y1 / img_size_h, x2 / img_size_w, y2 / img_size_h]))
+                    
+                    boxes_pred_original.append(torch.stack(boxes_pred_image) if boxes_pred_image else torch.zeros((0, 4), device=image_tensor.device))
+                    logits_pred_original.append(logits_pred_image)
+
+                # Calculate prediction loss
+                pred_box_loss, pred_cls_loss = calculate_box_loss(boxes_pred_original, logits_pred_original, batch["boxes"])
+                pred_loss = pred_box_loss + pred_cls_loss
+
+                # Total detector loss - now combining RL loss and prediction loss with weight
+                det_loss = pred_loss + rl_loss * args.reward_scale_2
+
+                # Gather the losses for logging
+                avg_gen_loss = accelerator.gather(gen_loss.repeat(args.train_batch_size)).mean()
+                avg_ldm_loss = accelerator.gather(ldm_loss.repeat(args.train_batch_size)).mean()
+                avg_l_cycle_loss = accelerator.gather(l_cycle_loss.repeat(args.train_batch_size)).mean()
+                
+                avg_det_loss = accelerator.gather(det_loss.repeat(args.train_batch_size)).mean()
+                avg_pred_loss = accelerator.gather(pred_loss.repeat(args.train_batch_size)).mean()
+                avg_i_cycle_loss = accelerator.gather(i_cycle_loss.repeat(args.train_batch_size)).mean()
+
+                train_loss += avg_gen_loss.item() / args.gradient_accumulation_steps
+                train_pretrain_loss += avg_ldm_loss.item() / args.gradient_accumulation_steps
+                train_cycle_loss += avg_l_cycle_loss.item() / args.gradient_accumulation_steps
+                
+                train_det_loss += avg_det_loss.item() / args.gradient_accumulation_steps
+                train_pred_loss += avg_pred_loss.item() / args.gradient_accumulation_steps
+                train_icycle_loss += avg_i_cycle_loss.item() / args.gradient_accumulation_steps
+
+                # Optimize both models simultaneously
+                optimizer.zero_grad()
+                optimizer_det.zero_grad()
+                
+                # Backward pass for generation model with retain_graph=True
+                accelerator.backward(gen_loss, retain_graph=True)
+                
+                # Backward pass for detection model
+                accelerator.backward(det_loss)
+                
                 if accelerator.sync_gradients:
-
+                    # Clip gradients for unet and text_encoder
                     params_to_clip = (
                         itertools.chain(unet.parameters(), filter(lambda p: p.requires_grad, text_encoder.parameters()))
                         if args.train_text_encoder
                         else unet.parameters()
                     )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    
+                    # Clip gradients for detection model
+                    accelerator.clip_grad_norm_(detect_model.parameters(), args.max_grad_norm)
+                
+                # Step optimizers
                 optimizer.step()
+                optimizer_det.step()
                 lr_scheduler.step()
+                lr_scheduler_det.step()
                 optimizer.zero_grad()
+                optimizer_det.zero_grad()
 
-            # Checks if the accele
-            # rator has performed an optimization step behind the scenes
+            # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
                     ema_unet.step(unet.parameters())
@@ -860,17 +980,26 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({
-                    "train_loss": train_loss,
-                    "train_pretrain_loss": train_pretrain_loss,
-                    "train_cycle_loss": train_cycle_loss,
-                    "lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
+                    "gen_loss": train_loss,
+                    "ldm_loss": train_pretrain_loss,
+                    "l_cycle_loss": train_cycle_loss,
+                    "det_loss": train_det_loss,
+                    "pred_loss": train_pred_loss,
+                    "i_cycle_loss": train_icycle_loss,
+                    "lr": lr_scheduler.get_last_lr()[0],
+                    "lr_det": lr_scheduler_det.get_last_lr()[0]}, step=global_step)
                 train_loss, train_pretrain_loss, train_cycle_loss = 0., 0., 0.
+                train_det_loss, train_pred_loss, train_icycle_loss = 0., 0., 0.
 
             logs = {
-                "loss_step": loss.detach().item(),
-                "pretrain_loss_step": pretrain_loss.detach().item(),
-                "cycle_loss_step": cycle_loss.detach().item(),
+                "gen_loss": gen_loss.detach().item(),
+                "ldm_loss": ldm_loss.detach().item(),
+                "l_cycle_loss": l_cycle_loss.detach().item(),
+                "det_loss": det_loss.detach().item(),
+                "pred_loss": pred_loss.detach().item(),
+                "i_cycle_loss": i_cycle_loss.detach().item(),
                 "lr": lr_scheduler.get_last_lr()[0],
+                "lr_det": lr_scheduler_det.get_last_lr()[0],
                 "epoch": epoch,
                 "step": global_step,
             }
@@ -891,6 +1020,7 @@ def main():
                         ema_text_encoder.store(text_encoder.parameters())
                         ema_text_encoder.copy_to(text_encoder.parameters())
                     unet_module = accelerator.unwrap_model(unet)
+                    detect_model_module = accelerator.unwrap_model(detect_model)
                     pipeline = StableDiffusionPipeline(
                         text_encoder=text_encoder if not args.train_text_encoder else accelerator.unwrap_model(text_encoder),
                         vae=vae,
@@ -900,8 +1030,23 @@ def main():
                         safety_checker=StableDiffusionSafetyChecker.from_pretrained(args.pretrained_model_name_or_path, subfolder="safety_checker"),
                         feature_extractor=CLIPFeatureExtractor.from_pretrained(os.path.join(args.pretrained_model_name_or_path, "feature_extractor")),
                     )
-                    os.makedirs(os.path.join(args.output_dir, 'checkpoint', 'iter_' + str(global_step)), exist_ok=True)
-                    pipeline.save_pretrained(os.path.join(args.output_dir, 'checkpoint', 'iter_' + str(global_step)))
+                    # os.makedirs(os.path.join(args.output_dir, 'checkpoint', 'iter_' + str(global_step)), exist_ok=True)
+                    # pipeline.save_pretrained(os.path.join(args.output_dir, 'checkpoint', 'iter_' + str(global_step)))
+                    #
+                    # ckpt_dir = os.path.join(args.output_dir, 'checkpoint', f'iter_{global_step}')
+                    # detect_model_ckpt_path = os.path.join(ckpt_dir, 'detect_model.pth')
+                    # torch.save(detect_model_module.state_dict(), detect_model_ckpt_path)
+
+                    ckpt_dir = os.path.join(args.output_dir, 'checkpoint', f'iter_{global_step}')
+                    os.makedirs(ckpt_dir, exist_ok=True)
+
+                    # Save the pipeline
+                    pipeline.save_pretrained(ckpt_dir)
+
+                    # Save the detection model
+                    detect_model_ckpt_path = os.path.join(ckpt_dir, 'detect_model.pth')
+                    torch.save(detect_model_module.state_dict(), detect_model_ckpt_path)
+
                     # restore online parameters
                     if args.use_ema:
                         ema_unet.restore(unet.parameters())
@@ -943,6 +1088,94 @@ def main():
 
     accelerator.end_training()
 
+def tokenize_coordinates(x, y, num_bucket_per_side):
+    # Convert Tensors to Python scalars if necessary
+    if isinstance(x, torch.Tensor):
+        x = x.item()
+    if isinstance(y, torch.Tensor):
+        y = y.item()
+    x_discrete = int(round(x * (num_bucket_per_side[0] - 1)))
+    y_discrete = int(round(y * (num_bucket_per_side[1] - 1)))
+    token = f"<l{y_discrete * num_bucket_per_side[0] + x_discrete}>"
+    return token
+
+def token_pair_from_bbox(bbox, num_bucket_per_side):
+    return tokenize_coordinates(bbox[0], bbox[1], num_bucket_per_side) + ' ' + tokenize_coordinates(bbox[2], bbox[3], num_bucket_per_side)
+
+def generate_text_from_boxes(boxes_pred, labels_pred, args, dataset_type, num_bucket_per_side):
+    objs = []
+    if dataset_type == 'nuimage':
+        class2text = {
+            0: 'car',
+            1: 'truck',
+            2: 'trailer',
+            3: 'bus',
+            4: 'construction',
+            5: 'bicycle',
+            6: 'motorcycle',
+            7: 'pedestrian',
+            8: 'cone',
+            9: 'barrier',
+        }
+        camera = 'front'  # Placeholder, adjust if necessary
+        for bbox, label in zip(boxes_pred, labels_pred):
+            label_name = class2text.get(int(label), 'object')
+            bbox_tokens = token_pair_from_bbox(bbox, num_bucket_per_side)
+            objs.append(' '.join([label_name, bbox_tokens]))
+        text = 'A driving scene image of ' + camera.lower() + ' camera with ' + ' '.join(objs)
+    elif dataset_type == 'coco':
+        class_names = [  # List of COCOStuffDataset classes
+            'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
+            'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+            'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+            'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket', 'bottle',
+            'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+            'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed',
+            'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven',
+            'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush',
+            'banner', 'blanket', 'branch', 'bridge', 'building other', 'bush', 'cabinet', 'cage', 'cardboard', 'carpet',
+            'ceiling other', 'ceiling tile', 'cloth', 'clothes', 'clouds', 'counter', 'cupboard', 'curtain', 'desk stuff', 'dirt',
+            'door stuff', 'fence', 'floor marble', 'floor other', 'floor stone', 'floor tile', 'floor wood', 'flower', 'fog', 'food other',
+            'fruit', 'furniture other', 'grass', 'gravel', 'ground other', 'hill', 'house', 'leaves', 'light', 'mat',
+            'metal', 'mirror stuff', 'moss', 'mountain', 'mud', 'napkin', 'net', 'paper', 'pavement', 'pillow', 'plant other', 'plastic',
+            'platform', 'playingfield', 'railing', 'railroad', 'river', 'road', 'rock', 'roof', 'rug', 'salad', 'sand', 'sea',
+            'shelf', 'sky other', 'skyscraper', 'snow', 'solid other', 'stairs', 'stone', 'straw', 'structural other', 'table',
+            'tent', 'textile other', 'towel', 'tree', 'vegetable',
+            'wall brick', 'wall concrete', 'wall other', 'wall panel', 'wall stone', 'wall tile', 'wall wood', 'water other',
+            'waterdrops', 'window blind', 'window other', 'wood', 'other'
+        ]
+        for bbox, label in zip(boxes_pred, labels_pred):
+            label_name = class_names[int(label)].replace('-', ' ')
+            bbox_tokens = token_pair_from_bbox(bbox, num_bucket_per_side)
+            objs.append(' '.join([label_name, bbox_tokens]))
+        text = 'An image with ' + ' '.join(objs)
+    else:
+        raise ValueError("Unsupported dataset type.")
+    return text
+
+def get_log_prob_of_labels(logits, labels):
+    """Calculate log probabilities of labels for RL training
+    
+    Args:
+        logits: Logits tensor with shape [B, N, C]
+        labels: Labels tensor with shape [B, N]
+    
+    Returns:
+        log_probs: Scalar, average log probability of all labels
+    """
+    batch_log_probs = []
+    for b_logits, b_labels in zip(logits, labels):
+        if len(b_labels) == 0:  # Handle case of empty detections
+            continue
+        probs = F.softmax(b_logits, dim=-1)  # [N, C]
+        dist = Categorical(probs)
+        log_probs = dist.log_prob(b_labels)  # [N]
+        batch_log_probs.append(log_probs.sum())  # Sum all boxes within each sample
+    
+    if not batch_log_probs:  # If no valid detections in the entire batch
+        return torch.tensor(0.0, device=logits[0].device)
+    
+    return torch.stack(batch_log_probs).mean()  # Average across batch
 
 if __name__ == "__main__":
     main()

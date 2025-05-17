@@ -86,7 +86,8 @@ def inference_detector_with_probs(model, img):
 
     Args:
         model (nn.Module): The loaded detector.
-        img (str/ndarray): Image file path or numpy array of the image.
+        img (str/ndarray/Tensor): Image file path, numpy array, or tensor of the image. 
+        Note that when you want to not cut off the gradient, you can only use tensor as input.
 
     Returns:
         det_bboxes: List of detected bounding boxes.
@@ -103,7 +104,64 @@ def inference_detector_with_probs(model, img):
         model_ = model
     device = next(model.parameters()).device  # model device
 
-    # Handle numpy array input
+    # Handle tensor input directly to preserve gradients
+    if isinstance(img, torch.Tensor):
+        # Process tensor input while preserving gradients
+        return _process_tensor_input(model_, cfg, img, device)
+    else:
+        # Process numpy array or image file path
+        return _process_numpy_input(model_, cfg, img, device)
+
+
+def _process_tensor_input(model_, cfg, img, device):
+    """Process tensor input to preserve gradients.
+    
+    Args:
+        model_ (nn.Module): The unwrapped detector model.
+        cfg (mmcv.Config): Model configuration.
+        img (torch.Tensor): Tensor of shape [C, H, W] or [B, C, H, W].
+        device (torch.device): Device for computation.
+        
+    Returns:
+        Tuple of (det_bboxes, det_labels, det_probs).
+    """
+    # Ensure input has correct shape [B, C, H, W]
+    if len(img.shape) == 3:  # [C, H, W]
+        img = img.unsqueeze(0)  # Convert to [1, C, H, W]
+    elif len(img.shape) == 4:  # Already [B, C, H, W]
+        pass
+    else:
+        raise ValueError(f"Unsupported tensor shape: {img.shape}")
+
+    # Move tensor to correct device
+    img = img.to(device)
+    
+    # Forward computation with or without gradients
+    with torch.set_grad_enabled(img.requires_grad):
+        # Extract features
+        x = model_.extract_feat(img)
+        
+        # RPN forward pass
+        img_shape = (img.shape[2], img.shape[3])
+        proposal_list = model_.rpn_head.simple_test_rpn(x, [{'img_shape': img_shape}])
+        
+        # Process results
+        return _process_model_outputs(model_, cfg, x, proposal_list, img_shape)
+
+
+def _process_numpy_input(model_, cfg, img, device):
+    """Process numpy array or file path input.
+    
+    Args:
+        model_ (nn.Module): The unwrapped detector model.
+        cfg (mmcv.Config): Model configuration.
+        img (str/ndarray): Image file path or numpy array.
+        device (torch.device): Device for computation.
+        
+    Returns:
+        Tuple of (det_bboxes, det_labels, det_probs).
+    """
+    # Handle numpy array input, without grad
     if isinstance(img, np.ndarray):
         cfg = cfg.copy()
         # Update pipeline to handle ndarray
@@ -129,7 +187,6 @@ def inference_detector_with_probs(model, img):
 
     # Scatter data to the correct device (GPU/CPU)
     data = scatter(data, [device])[0]
-
     img_metas = data["img_metas"][0]
 
     # Forward pass through the model
@@ -138,67 +195,79 @@ def inference_detector_with_probs(model, img):
         x = model_.extract_feat(data['img'][0])
         # RPN forward
         proposal_list = model_.rpn_head.simple_test_rpn(x, img_metas)
-
-        # Prepare rois for bbox head
-        rois = torch.cat([p.unsqueeze(0) for p in proposal_list], dim=0)
-
-        batch_index = torch.arange(
-            rois.size(0), device=rois.device).float().view(-1, 1, 1).expand(
-            rois.size(0), rois.size(1), 1)
-        rois = torch.cat([batch_index, rois[..., :4]], dim=-1)
-        batch_size = rois.shape[0]
-        num_proposals_per_img = rois.shape[1]
-
-        # Flatten rois
-        rois = rois.view(-1, 5)
-        # BBox head forward
-        bbox_results = model_.roi_head._bbox_forward(x, rois)
-        cls_logits = bbox_results['cls_score']
-        bbox_pred = bbox_results['bbox_pred']
-
-        # Recover the batch dimension
-        rois = rois.view(batch_size, num_proposals_per_img, -1)
-        cls_logits = cls_logits.view(batch_size, num_proposals_per_img, -1)
-        bbox_pred = bbox_pred.view(batch_size, num_proposals_per_img, -1)
-
-        # Apply softmax to get class probabilities
-        scores = F.softmax(cls_logits, dim=-1)
-
-        # Decode boxes
+        
+        # Get image shape and scale factor from img_metas
         img_shape = img_metas[0]['img_shape']
-        num_classes = cls_logits.shape[-1] - 1  # Exclude background
-        bboxes = model_.roi_head.bbox_head.bbox_coder.decode(
-            rois[..., 1:], bbox_pred, max_shape=img_shape)
+        scale_factor = img_metas[0]['scale_factor']
+        
+        # Process results
+        return _process_model_outputs(model_, cfg, x, proposal_list, img_shape, scale_factor)
 
-        # Reshape bboxes to [batch_size, num_proposals_per_img, num_classes, 4]
-        bboxes = bboxes.view(batch_size, num_proposals_per_img, num_classes, 4)
 
-        # Reshape scale_factor to [1, 1, 1, 4] for broadcasting
-        scale_factor = bboxes.new_tensor(img_metas[0]['scale_factor']).view(1, 1, 1, 4)
+def _process_model_outputs(model_, cfg, x, proposal_list, img_shape, scale_factor=None, score_thr=0.5, sharpness=50.0):
+    """
+    Process model outputs to get differentiable bounding boxes, class scores, and logits.
 
-        # Perform element-wise division
-        bboxes /= scale_factor
+    Args:
+        model_ (nn.Module): The detector model.
+        cfg (mmcv.Config): Model configuration.
+        x (list): Feature maps from backbone.
+        proposal_list (list): RPN proposals.
+        img_shape (tuple): Image shape.
+        scale_factor (tuple, optional): For resizing bbox back to original scale.
+        score_thr (float): Confidence threshold for soft gating.
+        sharpness (float): Controls the softness of gating (higher = sharper cutoff).
 
-        det_bboxes = []
-        det_labels = []
-        det_probs = []
+    Returns:
+        bboxes: Tensor of shape [B, N, 4]
+        scores: Tensor of shape [B, N, C] (probabilities, no background)
+        cls_logits: Tensor of shape [B, N, C] (logits, no background)
+    """
+    # Construct ROI tensor
+    rois = torch.cat([p.unsqueeze(0) for p in proposal_list], dim=0)
+    batch_index = torch.arange(rois.size(0), device=rois.device).float().view(-1, 1, 1).expand(rois.size(0), rois.size(1), 1)
+    rois = torch.cat([batch_index, rois[..., :4]], dim=-1)  # [B, N, 5]
+    batch_size, num_proposals_per_img = rois.shape[:2]
 
-        # Perform NMS using your my_multiclass_nms
-        for i in range(batch_size):
-            bbox = bboxes[i]  # [num_proposals_per_img, num_classes, 4]
-            score = scores[i, :, :-1]  # Exclude background class
+    # Flatten for ROI head
+    rois = rois.view(-1, 5)
+    bbox_results = model_.roi_head._bbox_forward(x, rois)
+    cls_logits = bbox_results['cls_score']         # [B*N, C+1]
+    bbox_pred = bbox_results['bbox_pred']          # [B*N, 4*(C)]
 
-            # Reshape for NMS
-            bbox = bbox.reshape(-1, 4 * num_classes)
-            score = score.reshape(-1, num_classes)
+    # Restore batch shape
+    rois = rois.view(batch_size, num_proposals_per_img, -1)
+    cls_logits = cls_logits.view(batch_size, num_proposals_per_img, -1)  # [B, N, C+1]
+    bbox_pred = bbox_pred.view(batch_size, num_proposals_per_img, -1)
 
-            # Call your my_multiclass_nms function
-            det_bbox, det_label, det_prob = my_multiclass_nms(
-                bbox, score, cfg.model.test_cfg.rcnn.score_thr,
-                cfg.model.test_cfg.rcnn.nms, cfg.model.test_cfg.rcnn.max_per_img)
+    # Classification: softmax and extract foreground
+    scores = F.softmax(cls_logits, dim=-1)          # [B, N, C+1]
+    scores_no_bg = scores[:, :, :-1]                # [B, N, C]
+    cls_logits_no_bg = cls_logits[:, :, :-1]        # [B, N, C]
+    num_classes = scores_no_bg.shape[-1]
 
-            det_bboxes.append(det_bbox)
-            det_labels.append(det_label)
-            det_probs.append(det_prob)
+    # Decode per-class bboxes
+    decoded_bboxes = model_.roi_head.bbox_head.bbox_coder.decode(
+        rois[..., 1:], bbox_pred, max_shape=img_shape
+    )  # [B, N, C*4]
+    decoded_bboxes = decoded_bboxes.view(batch_size, num_proposals_per_img, num_classes, 4)
 
-    return det_bboxes, det_labels, det_probs
+    if scale_factor is not None:
+        scale_factor = decoded_bboxes.new_tensor(scale_factor).view(1, 1, 1, 4)
+        decoded_bboxes /= scale_factor
+
+    # Soft-argmax: compute weighted sum over all class predictions
+    weights = scores_no_bg / (scores_no_bg.sum(dim=-1, keepdim=True) + 1e-6)  # [B, N, C]
+    bboxes = torch.sum(decoded_bboxes * weights.unsqueeze(-1), dim=2)         # [B, N, 4]
+
+    # Soft gating: suppress low-confidence proposals smoothly
+    max_scores, _ = scores_no_bg.max(dim=-1)                                   # [B, N]
+    soft_mask = torch.sigmoid((max_scores - score_thr) * sharpness)           # [B, N]
+
+    bboxes = bboxes * soft_mask.unsqueeze(-1)                  # [B, N, 4]
+    scores_no_bg = scores_no_bg * soft_mask.unsqueeze(-1)      # [B, N, C]
+    cls_logits_no_bg = cls_logits_no_bg * soft_mask.unsqueeze(-1)  # [B, N, C]
+    labels = torch.argmax(scores_no_bg, dim=-1)
+
+    return bboxes, labels, cls_logits_no_bg
+

@@ -142,150 +142,33 @@ nuimages_classes = ['car', 'truck', 'trailer', 'bus', 'construction_vehicle',
                     'bicycle', 'motorcycle', 'pedestrian', 'traffic_cone', 'barrier'
                     ]
 
-
-# def calculate_box_loss(boxes_pred, labels_pred, scores_pred, boxes, args):
-#     batch_size = len(boxes_pred)
-#
-#     pred_boxes = torch.zeros((batch_size, args.max_boxes_per_img, 4), dtype=torch.float32, device=boxes.device)
-#     pred_labels = torch.zeros((batch_size, args.max_boxes_per_img), dtype=torch.int64, device=boxes.device)
-#     pred_scores = torch.zeros((batch_size, args.max_boxes_per_img), dtype=torch.float32, device=boxes.device)
-#     pred_masks = torch.zeros((batch_size, args.max_boxes_per_img), dtype=torch.bool, device=boxes.device)
-#
-#     # Prepare ground truth data
-#     gt_boxes = boxes[:, :, :4]
-#     gt_labels = boxes[:, :, 4].long()
-#
-#     # matched_idxs = []
-#     assigned_gt_boxes = []
-#     assigned_gt_ids = []
-#
-#     for batch_id in range(batch_size):
-#
-#         # prevent detected objects > self.max_boxes_per_data
-#         current_batch_size = min(len(boxes_pred[batch_id]), args.max_boxes_per_img)
-#         for object_id in range(current_batch_size):
-#             obj = torch.tensor(boxes_pred[batch_id][object_id], dtype=torch.float32).to(boxes.device)
-#             label = torch.tensor(labels_pred[batch_id][object_id], dtype=torch.float32).to(boxes.device)
-#             score = torch.tensor(scores_pred[batch_id][object_id], dtype=torch.float32).to(boxes.device)
-#             pred_boxes[batch_id, object_id] = obj.clone().detach().to(boxes.device)
-#             pred_labels[batch_id, object_id] = label.clone().detach().to(boxes.device)
-#             pred_scores[batch_id, object_id] = score.clone().detach().to(boxes.device)
-#             pred_masks[batch_id, object_id] = True
-#
-#         # Compute IoU between ground truth and predictions
-#         match_quality_matrix = box_ops.box_iou(gt_boxes[batch_id], pred_boxes[batch_id])
-#
-#         proposal_matcher = Matcher(0.5, 0.5, allow_low_quality_matches=False)
-#         matched_idxs_in_image = proposal_matcher(match_quality_matrix)
-#
-#         clamped_matched_idxs = matched_idxs_in_image.clamp(min=0)
-#         assigned_gt_boxes.append(gt_boxes[batch_id][clamped_matched_idxs])
-#         assigned_gt_ids.append(gt_labels[batch_id][clamped_matched_idxs])
-#
-#     assigned_gt_boxes = torch.stack(assigned_gt_boxes)
-#     assigned_gt_ids = torch.stack(assigned_gt_ids)
-#
-#     flat_pred_labels = pred_labels[pred_masks].view(-1)
-#     flat_assigned_gt_labels = assigned_gt_ids[pred_masks]
-#     flat_scores = pred_scores[pred_masks].view(-1)
-#
-#     margin = 1.0
-#     labels_one_hot = F.one_hot(flat_assigned_gt_labels, num_classes=args.num_classes).float()
-#     flat_pred_labels_one_hot = F.one_hot(flat_pred_labels, num_classes=args.num_classes).float()
-#
-#     pred_boxes.requires_grad_()
-#     flat_pred_labels_one_hot.requires_grad_()
-#
-#     loss_cls = torch.clamp(margin - flat_pred_labels_one_hot * labels_one_hot, min=0)
-#     loss_cls = loss_cls * flat_scores.view(-1, 1)
-#
-#     # Compute losses
-#     loss_box = F.l1_loss(pred_boxes[pred_masks==1], assigned_gt_boxes[pred_masks==1], reduction='none')
-#     loss_box = loss_box * flat_scores.view(-1, 1)
-#
-#     return loss_box, loss_cls
-
-# import torch
-# import torch.nn.functional as F
-#
-# def calculate_box_loss(boxes_pred, labels_pred, scores_pred, boxes, args):
-#     batch_size = len(boxes_pred)
-#
-#     pred_boxes = torch.zeros((batch_size, args.max_boxes_per_img, 4), dtype=torch.float32, device=boxes.device)
-#     pred_labels = torch.zeros((batch_size, args.max_boxes_per_img), dtype=torch.int64, device=boxes.device)
-#     pred_scores = torch.zeros((batch_size, args.max_boxes_per_img), dtype=torch.float32, device=boxes.device)
-#     pred_masks = torch.zeros((batch_size, args.max_boxes_per_img), dtype=torch.bool, device=boxes.device)
-#
-#     # Prepare ground truth data
-#     gt_boxes = boxes[:, :, :4]
-#     gt_labels = boxes[:, :, 4].long()
-#
-#     assigned_gt_boxes = []
-#     assigned_gt_ids = []
-#
-#     for batch_id in range(batch_size):
-#         # Prevent detected objects > self.max_boxes_per_img
-#         current_batch_size = min(len(boxes_pred[batch_id]), args.max_boxes_per_img)
-#         for object_id in range(current_batch_size):
-#             obj = torch.tensor(boxes_pred[batch_id][object_id], dtype=torch.float32).to(boxes.device)
-#             label = torch.tensor(labels_pred[batch_id][object_id], dtype=torch.float32).to(boxes.device)
-#             score = torch.tensor(scores_pred[batch_id][object_id], dtype=torch.float32).to(boxes.device)
-#             pred_boxes[batch_id, object_id] = obj.clone().detach()
-#             pred_labels[batch_id, object_id] = label.clone().detach()
-#             pred_scores[batch_id, object_id] = score.clone().detach()
-#             pred_masks[batch_id, object_id] = True
-#
-#
-#         # Compute IoU between ground truth and predictions
-#         match_quality_matrix = box_ops.box_iou(gt_boxes[batch_id], pred_boxes[batch_id])
-#
-#         proposal_matcher = Matcher(0.5, 0.5, allow_low_quality_matches=False)
-#         matched_idxs_in_image = proposal_matcher(match_quality_matrix)
-#
-#         clamped_matched_idxs = matched_idxs_in_image.clamp(min=0)
-#         assigned_gt_boxes.append(gt_boxes[batch_id][clamped_matched_idxs])
-#         assigned_gt_ids.append(gt_labels[batch_id][clamped_matched_idxs])
-#
-#     assigned_gt_boxes = torch.stack(assigned_gt_boxes)
-#     assigned_gt_ids = torch.stack(assigned_gt_ids)
-#
-#     # Now process all batches at once
-#     loss_box_list = []
-#     loss_cls_list = []
-#
-#     for batch_id in range(batch_size):
-#         pred_boxes_single = pred_boxes[batch_id][pred_masks[batch_id]]
-#         assigned_gt_boxes_single = assigned_gt_boxes[batch_id][pred_masks[batch_id]]
-#         pred_labels_single = pred_labels[batch_id][pred_masks[batch_id]]
-#         assigned_gt_labels_single = assigned_gt_ids[batch_id][pred_masks[batch_id]]
-#         pred_scores_single = pred_scores[batch_id][pred_masks[batch_id]]
-#
-#         # Classification loss
-#         margin = 1.0
-#         labels_one_hot = F.one_hot(assigned_gt_labels_single, num_classes=args.num_classes).float()
-#         pred_labels_one_hot = F.one_hot(pred_labels_single, num_classes=args.num_classes).float()
-#
-#         loss_cls_single = torch.clamp(margin - pred_labels_one_hot * labels_one_hot, min=0)
-#         loss_cls_single = (loss_cls_single * pred_scores_single.view(-1, 1)).sum(dim=1).mean()
-#
-#         # Bounding box loss
-#         loss_box_single = F.l1_loss(pred_boxes_single, assigned_gt_boxes_single, reduction='none')
-#         loss_box_single = (loss_box_single * pred_scores_single.view(-1, 1)).sum(dim=1).mean()
-#
-#         loss_box_list.append(loss_box_single)
-#         loss_cls_list.append(loss_cls_single)
-#
-#     loss_box = torch.stack(loss_box_list).view(batch_size, 1)
-#     loss_cls = torch.stack(loss_cls_list).view(batch_size, 1)
-#
-#     return loss_box, loss_cls
-
 import torch
 import torch.nn.functional as F
 
-def calculate_box_loss(boxes_pred, labels_pred, logits_pred, boxes, args):
-    batch_size = len(boxes_pred)
-
+def calculate_box_loss(boxes_pred, logits_pred, boxes):
+    """Calculate box and classification loss.
+    
+    Args:
+        boxes_pred (Tensor or list): Predicted boxes, either tensor [batch_size, num_boxes, 4] or list of lists
+        labels_pred (Tensor or list): Predicted labels, either tensor [batch_size, num_boxes] or list of lists
+        logits_pred (Tensor or list): Predicted logits, either tensor [batch_size, num_boxes, num_classes] or list of lists
+        boxes (Tensor): Ground truth boxes with shape [batch_size, max_boxes, 5], where last dim is [x1, y1, x2, y2, label]
+        args: Additional arguments
+        
+    Returns:
+        Tuple of (box_loss, cls_loss)
+    """
+    # Get device of ground truth boxes
+    device = boxes.device
+    
+    # Determine batch size (either from tensors or lists)
+    if isinstance(boxes_pred, torch.Tensor):
+        batch_size = boxes_pred.size(0)
+        is_tensor_input = True
+    else:
+        batch_size = len(boxes_pred)
+        is_tensor_input = False
+    
     loss_box_total = 0.0
     loss_cls_total = 0.0
 
@@ -294,23 +177,31 @@ def calculate_box_loss(boxes_pred, labels_pred, logits_pred, boxes, args):
     gt_labels = boxes[:, :, 4].long()  # (bs, max_boxes)
 
     for batch_id in range(batch_size):
-        # Check if this batch should be considered for loss calculation
-
         # Get the current batch's predicted boxes, labels, and logits
-        pred_boxes_single = boxes_pred[batch_id]
-        pred_labels_single = labels_pred[batch_id]
-        logits_pred_single = logits_pred[batch_id]
+        if is_tensor_input:
+            # If the input is already tensor format
+            pred_boxes_single = boxes_pred[batch_id]
+            logits_pred_single = logits_pred[batch_id]
+            
+            # Handle case where pred_boxes_single might be empty
+            if pred_boxes_single.numel() == 0:
+                loss_cls_total += torch.tensor(1.0, device=device)
+                loss_box_total += torch.tensor(1.0, device=device)
+                continue
+        else:
+            # If the input is list format
+            pred_boxes_single = boxes_pred[batch_id]
+            logits_pred_single = logits_pred[batch_id]
 
-        if len(pred_boxes_single) == 0:  # No predicted boxes
-            # Add penalty loss for empty predictions (can be adjusted based on your requirements)
-            loss_cls_total += torch.tensor(1.0, device=boxes.device)
-            loss_box_total += torch.tensor(1.0, device=boxes.device)
-            continue
+            if len(pred_boxes_single) == 0:  # No predicted boxes
+                # Add penalty loss for empty predictions
+                loss_cls_total += torch.tensor(1.0, device=device)
+                loss_box_total += torch.tensor(1.0, device=device)
+                continue
 
-        # Convert to tensors and move to the correct device
-        pred_boxes_single = torch.tensor(pred_boxes_single, dtype=torch.float32, device=boxes.device)
-        pred_labels_single = torch.tensor(pred_labels_single, dtype=torch.long, device=boxes.device)
-        logits_pred_single = torch.tensor(logits_pred_single, dtype=torch.float32, device=boxes.device)
+            # Convert to tensors and move to the correct device
+            pred_boxes_single = torch.tensor(pred_boxes_single, dtype=torch.float32, device=device)
+            logits_pred_single = torch.tensor(logits_pred_single, dtype=torch.float32, device=device)
 
         # Compute IoU between ground truth and predictions
         match_quality_matrix = box_ops.box_iou(gt_boxes[batch_id], pred_boxes_single)
@@ -342,55 +233,34 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 def visualize_predictions(image, boxes_score_pred_image, labels_pred_image, gt_boxes, score_threshold=0.5):
-    # 创建一个Figure
     fig, ax = plt.subplots(1)
-    # 将原始图像放在背景
     ax.imshow(image)
 
-    # 遍历每个预测的box
     for i, box in enumerate(boxes_score_pred_image):
         x1, y1, x2, y2, score = box
         label = labels_pred_image[i]
 
-        # 只绘制 score 大于阈值的框
         if score > score_threshold:
-            # 创建矩形框 (红色框为预测框)
             width, height = x2 - x1, y2 - y1
             rect = patches.Rectangle((x1, y1), width, height, linewidth=2, edgecolor='r', facecolor='none')
 
-            # 绘制矩形框
             ax.add_patch(rect)
 
-            # 在框的左上角显示标签和得分
             ax.text(x1, y1 - 5, f'Label: {label}, Score: {score:.2f}', color='yellow', fontsize=12, weight='bold', bbox=dict(facecolor='blue', alpha=0.5))
 
-    # 遍历每个gt box
     for i, box in enumerate(gt_boxes):
         x1, y1, x2, y2, label = box
 
-        # 跳过全零的box
         if torch.all(box == 0):
             continue
 
-        # 创建矩形框 (绿色框为真实框)
         width, height = x2 - x1, y2 - y1
         rect = patches.Rectangle((x1 * image.shape[1], y1 * image.shape[0]), width * image.shape[1], height * image.shape[0],
                                  linewidth=2, edgecolor='g', facecolor='none')
 
-        # 绘制矩形框
         ax.add_patch(rect)
 
-        # 在框的左上角显示标签 (真实框的标签)
         ax.text(x1 * image.shape[1], (y1 * image.shape[0]) - 5, f'GT Label: {int(label)}', color='white', fontsize=12, weight='bold', bbox=dict(facecolor='green', alpha=0.5))
 
     plt.axis('off')
     plt.show()
-
-# 示例调用
-# visualize_predictions(image, boxes_score_pred_image, labels_pred_image, gt_boxes)
-# tensor([ 66, 166, 283, 413,  55, 360, 168, 310, 268,  73, 299, 616, 681, 163,
-#          754, 520], device='cuda:0')
-# tensor([100, 407, 952, 299, 866, 901, 589, 801, 231,   5,  20, 527,  53, 441,
-#         609, 329], device='cuda:0')
-# tensor([100, 407, 952, 299, 866, 901, 589, 801, 231,   5,  20, 527,  53, 441,
-#         609, 329], device='cuda:0')

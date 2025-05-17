@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+from torch.distributions import Categorical
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -30,8 +31,6 @@ from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 from mmcv import Config
 from mmdet.datasets import build_dataset
 import utils.misc as misc
-# from YOLOv4.tool.torch_utils import do_detect
-# from YOLOv4.tool.darknet2pytorch import Darknet
 from utils.det_utils import calculate_box_loss
 from mmdet.apis import init_detector
 from utils.inference_with_probs import inference_detector_with_probs
@@ -425,6 +424,30 @@ class SplitEmbedding(nn.Module):
             input, weight, self.padding_idx, self.max_norm,
             self.norm_type, self.scale_grad_by_freq, self.sparse)
 
+def get_log_prob_of_labels(logits, labels):
+    """Calculate log probabilities of labels for RL training
+    
+    Args:
+        logits: Logits tensor with shape [B, N, C]
+        labels: Labels tensor with shape [B, N]
+    
+    Returns:
+        log_probs: Scalar, average log probability of all labels
+    """
+    batch_log_probs = []
+    for b_logits, b_labels in zip(logits, labels):
+        if len(b_labels) == 0:  # Handle case of empty detections
+            continue
+        probs = F.softmax(b_logits, dim=-1)  # [N, C]
+        dist = Categorical(probs)
+        log_probs = dist.log_prob(b_labels)  # [N]
+        batch_log_probs.append(log_probs.sum())  # Sum all boxes within each sample
+    
+    if not batch_log_probs:  # If no valid detections in the entire batch
+        return torch.tensor(0.0, device=logits[0].device)
+    
+    return torch.stack(batch_log_probs).mean()  # Average across batch
+
 def main():
     args = parse_args()
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
@@ -669,7 +692,6 @@ def main():
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
-
         optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
@@ -824,40 +846,31 @@ def main():
                     sample_latents = sample_latents.to(vae.dtype)
                     reconstructed_images = vae.decode(sample_latents / 0.18215).sample
                     reconstructed_images = (reconstructed_images / 2 + 0.5).clamp(0, 1)
-                    reconstructed_images = reconstructed_images.cpu().permute(0, 2, 3, 1).float().detach().numpy()
-                    reconstructed_images = [np.array(image) for image in reconstructed_images]
-                    # images = torch.stack(reconstructed_images, dim=0)
-
-                    images = [(image * 255).astype(np.uint8) for image in reconstructed_images]
-                    # results = inference_detector(detect_model, images)
 
                     boxes_pred = []
-                    scores_pred = []
                     labels_pred = []
                     logits_pred = []
 
-                    for i, (image, mask) in enumerate(zip(images, timestep_mask)):
+                    for i, mask in enumerate(timestep_mask):
                         if mask.item() == 0:
                             continue
 
                         boxes_pred_image = []
-                        scores_pred_image = []
 
-                        boxes_score_pred_image, labels_pred_image, logits_pred_image = inference_detector_with_probs(detect_model, image)
-                        boxes_score_pred_image = boxes_score_pred_image[0].cpu()
-                        labels_pred_image = labels_pred_image[0].cpu()
-                        logits_pred_image = logits_pred_image[0].cpu()
-                        gt_boxes = batch["boxes"][i].cpu()
+                        image_tensor = reconstructed_images[i:i+1]
+                        # Convert image tensor to float32 to match the detection model's weight type
+                        image_tensor = image_tensor.to(dtype=torch.float32)
+                        boxes_score_pred_image, _, logits_pred_image = inference_detector_with_probs(detect_model, image_tensor)
+                        boxes_score_pred_image = boxes_score_pred_image[0]
+                        logits_pred_image = logits_pred_image[0]
+                        gt_boxes = batch["boxes"][i]
 
                         for detection in boxes_score_pred_image:
-                            x1, y1, x2, y2, score = detection
-                            boxes_pred_image.append([x1 / img_size_w, y1 / img_size_h, x2 / img_size_w, y2 / img_size_h])
-                            scores_pred_image.append(score.item())
+                            x1, y1, x2, y2 = detection
+                            boxes_pred_image.append(torch.stack([x1 / img_size_w, y1 / img_size_h, x2 / img_size_w, y2 / img_size_h]))
 
-                        boxes_pred.append(boxes_pred_image)
-                        scores_pred.append(scores_pred_image)
-                        labels_pred.append(labels_pred_image.tolist())
-                        logits_pred.append(logits_pred_image.tolist())
+                        boxes_pred.append(torch.stack(boxes_pred_image) if boxes_pred_image else torch.zeros((0, 4), device=image_tensor.device))
+                        logits_pred.append(logits_pred_image)
 
                     filtered_gt_boxes = batch["boxes"][timestep_mask.view(-1)]
 
@@ -865,7 +878,7 @@ def main():
                         box_loss = torch.tensor(0.0, device=filtered_gt_boxes.device)
                         cls_loss = torch.tensor(0.0, device=filtered_gt_boxes.device)
                     else:
-                        box_loss, cls_loss = calculate_box_loss(boxes_pred, labels_pred, logits_pred, filtered_gt_boxes, args)
+                        box_loss, cls_loss = calculate_box_loss(boxes_pred, logits_pred, filtered_gt_boxes)
 
                     cycle_loss = box_loss + cls_loss
                     cycle_loss = cycle_loss / (timestep_mask.sum() + 1e-10)
@@ -873,8 +886,9 @@ def main():
                     pretrain_loss = (noise_pred.float() - noise.float()) ** 2 # [B, 4, H, W]
                     pretrain_loss = pretrain_loss * batch["bbox_mask"] if args.foreground_loss_mode else pretrain_loss
                     pretrain_loss = pretrain_loss.mean()
-
-                    loss = pretrain_loss + cycle_loss * args.reward_scale
+                    
+                    # Total loss combining RL loss and prediction loss
+                    loss = pretrain_loss * args.reward_scale_2 + cycle_loss
 
                     # Gather the losses across all processes for logging (if we use distributed training).
                     avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -951,30 +965,30 @@ def main():
                     sample_latents = sample_latents.to(vae.dtype)
                     reconstructed_images = vae.decode(sample_latents / 0.18215).sample
                     reconstructed_images = (reconstructed_images / 2 + 0.5).clamp(0, 1)
-                    reconstructed_images = reconstructed_images.cpu().permute(0, 2, 3, 1).float().detach().numpy()
-                    reconstructed_images = [np.array(image) for image in reconstructed_images]
-
-                    images = [(image * 255).astype(np.uint8) for image in reconstructed_images]
-
+                    
                     boxes_pred = []
                     labels_pred = []
                     logits_pred = []
 
                     # Get boxes_pred and labels_pred from detection_model
-                    for image in images:
-                        boxes_score_pred_image, labels_pred_image, logits_pred_image = inference_detector_with_probs(detect_model, image)
-                        boxes_score_pred_image = boxes_score_pred_image[0].cpu()
-                        labels_pred_image = labels_pred_image[0].cpu()
-                        logits_pred_image = logits_pred_image[0].cpu()
+                    for i in range(reconstructed_images.shape[0]):
+                        image_tensor = reconstructed_images[i:i+1]
+                        # Convert image tensor to float32 to match the detection model's weight type
+                        image_tensor = image_tensor.to(dtype=torch.float32)
+                        boxes_score_pred_image, labels_pred_image, logits_pred_image = inference_detector_with_probs(detect_model, image_tensor)
+                        boxes_score_pred_image = boxes_score_pred_image[0]
+                        labels_pred_image = labels_pred_image[0]
+                        logits_pred_image = logits_pred_image[0]
+                        
                         boxes_pred_image = []
                         for detection in boxes_score_pred_image:
-                            x1, y1, x2, y2, score = detection
-                            boxes_pred_image.append([x1 / img_size_w, y1 / img_size_h, x2 / img_size_w, y2 / img_size_h])
-                        boxes_pred.append(boxes_pred_image)
-                        labels_pred.append(labels_pred_image.tolist())
-                        logits_pred.append(logits_pred_image.tolist())
+                            x1, y1, x2, y2 = detection
+                            boxes_pred_image.append(torch.stack([x1 / img_size_w, y1 / img_size_h, x2 / img_size_w, y2 / img_size_h]))
+                        
+                        boxes_pred.append(torch.stack(boxes_pred_image) if boxes_pred_image else torch.zeros((0, 4), device=image_tensor.device))
+                        labels_pred.append(labels_pred_image)
+                        logits_pred.append(logits_pred_image)
 
-                    # Generate texts from boxes_pred and labels_pred
                     texts_from_boxes = []
                     for b_pred, l_pred in zip(boxes_pred, labels_pred):
                         text = generate_text_from_boxes(b_pred, l_pred, args, dataset_type, num_bucket_per_side)
@@ -982,6 +996,7 @@ def main():
 
                     # Tokenize the new captions
                     input_ids_2 = tokenizer(texts_from_boxes, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(accelerator.device)
+                    
                     # Get encoder_hidden_states_2
                     encoder_hidden_states_2 = text_encoder(input_ids_2)[0]
 
@@ -991,30 +1006,48 @@ def main():
                     pretrain_loss = (noise_pred.float() - noise_pred_2.float()) ** 2  # [B, 4, H, W]
                     pretrain_loss = pretrain_loss.mean()
 
-                    # Now compute pred_loss: detect batch["pixel_values"] with detection_model and compare to batch["boxes"]
-                    original_images = batch["pixel_values"].cpu().permute(0, 2, 3, 1).float().detach().numpy()
-                    original_images = (original_images * 255).astype(np.uint8)
+                    # Use RL strategy for training - use pretrain_loss as reward signal
+                    reward = -pretrain_loss.detach()  # Use negative pretrain_loss as reward, detached from computation graph
+                    log_prob = get_log_prob_of_labels(logits_pred, labels_pred)
+                    rl_loss = -log_prob * reward  # Policy gradient formula
+                    
+                    # Compute prediction loss
+                    original_images = batch["pixel_values"]  # Directly use tensor format [B, C, H, W]
+                    
                     boxes_pred_original = []
-                    labels_pred_original = []
                     logits_pred_original = []
-                    for image in original_images:
-                        boxes_score_pred_image, labels_pred_image, logits_pred_image = inference_detector_with_probs(detect_model, image)
-                        boxes_score_pred_image = boxes_score_pred_image[0].cpu()
-                        labels_pred_image = labels_pred_image[0].cpu()
-                        logits_pred_image = logits_pred_image[0].cpu()
+                    
+                    for i in range(original_images.shape[0]):
+                        image_tensor = original_images[i:i+1]
+                        # Convert image tensor to float32 to match the detection model's weight type
+                        image_tensor = image_tensor.to(dtype=torch.float32)
+                        boxes_score_pred_image, _, logits_pred_image = inference_detector_with_probs(detect_model, image_tensor)
+                        boxes_score_pred_image = boxes_score_pred_image[0]
+                        logits_pred_image = logits_pred_image[0]
+                        
                         boxes_pred_image = []
                         for detection in boxes_score_pred_image:
-                            x1, y1, x2, y2, score = detection
-                            boxes_pred_image.append([x1 / img_size_w, y1 / img_size_h, x2 / img_size_w, y2 / img_size_h])
-                        boxes_pred_original.append(boxes_pred_image)
-                        labels_pred_original.append(labels_pred_image.tolist())
-                        logits_pred_original.append(logits_pred_image.tolist())
+                            x1, y1, x2, y2 = detection
+                            boxes_pred_image.append(torch.stack([x1 / img_size_w, y1 / img_size_h, x2 / img_size_w, y2 / img_size_h]))
+                        
+                        boxes_pred_original.append(torch.stack(boxes_pred_image) if boxes_pred_image else torch.zeros((0, 4), device=image_tensor.device))
+                        logits_pred_original.append(logits_pred_image)
 
                     # Now compute pred_loss between boxes_pred_original and batch["boxes"]
-                    box_loss, cls_loss = calculate_box_loss(boxes_pred_original, labels_pred_original, logits_pred_original, batch["boxes"], args)
+                    box_loss, cls_loss = calculate_box_loss(boxes_pred_original, logits_pred_original, batch["boxes"])
                     pred_loss = box_loss + cls_loss
 
-                    loss = pred_loss + pretrain_loss * args.reward_scale_2
+                    # Total loss combining RL loss and prediction loss
+                    loss = rl_loss * args.reward_scale_2 + pred_loss
+
+                    # Gather the losses across all processes for logging (if we use distributed training).
+                    avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                    avg_pretrain_loss = accelerator.gather(pred_loss.repeat(args.train_batch_size)).mean()
+                    avg_cycle_loss = accelerator.gather(rl_loss.repeat(args.train_batch_size)).mean()
+                
+                    train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                    train_pretrain_loss += avg_pretrain_loss.item() / args.gradient_accumulation_steps
+                    train_cycle_loss += avg_cycle_loss.item() / args.gradient_accumulation_steps
 
                     # Back propagate
                     loss = loss.contiguous()
@@ -1047,8 +1080,8 @@ def main():
 
             logs = {
                 "loss_step": loss.detach().item(),
-                "pretrain_loss_step": pretrain_loss.detach().item(),
-                "cycle_loss_step": cycle_loss.detach().item() if 'cycle_loss' in locals() else 0.0,
+                "pretrain_loss_step": train_pretrain_loss,
+                "cycle_loss_step": train_cycle_loss,
                 "lr": lr_scheduler.get_last_lr()[0],
                 "epoch": epoch,
                 "step": global_step,
@@ -1080,13 +1113,7 @@ def main():
                         safety_checker=StableDiffusionSafetyChecker.from_pretrained(args.pretrained_model_name_or_path, subfolder="safety_checker"),
                         feature_extractor=CLIPFeatureExtractor.from_pretrained(os.path.join(args.pretrained_model_name_or_path, "feature_extractor")),
                     )
-                    # os.makedirs(os.path.join(args.output_dir, 'checkpoint', 'iter_' + str(global_step)), exist_ok=True)
-                    # pipeline.save_pretrained(os.path.join(args.output_dir, 'checkpoint', 'iter_' + str(global_step)))
-                    #
-                    # ckpt_dir = os.path.join(args.output_dir, 'checkpoint', f'iter_{global_step}')
-                    # detect_model_ckpt_path = os.path.join(ckpt_dir, 'detect_model.pth')
-                    # torch.save(detect_model_module.state_dict(), detect_model_ckpt_path)
-
+                    
                     ckpt_dir = os.path.join(args.output_dir, 'checkpoint', f'iter_{global_step}')
                     os.makedirs(ckpt_dir, exist_ok=True)
 
